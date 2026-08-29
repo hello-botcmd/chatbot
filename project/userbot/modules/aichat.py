@@ -1,147 +1,256 @@
 """
 userbot/modules/aichat.py
-──────────────────────────
-Core AI auto-reply logic for each Telethon userbot account.
-- Replies to private DMs with AI (OpenRouter).
-- Sends paid photo when trigger word is detected.
-- Per-account settings (persona, ai_enabled, history, cooldown).
-- Thread-safe via per-user asyncio.Lock.
+─────────────────────────
+Handles for each Pyrogram userbot client:
+  • AI auto-reply on private DMs
+  • Paid-photo trigger on keyword list
+  • Per-peer asyncio lock (no double-firing)
+  • Persistent typing indicator during AI call
+  • Robust error recovery — never silently dies
 """
 
 import asyncio
 import logging
 import time
 
-from telethon import TelegramClient, events
+from pyrogram import Client, filters
+from pyrogram.enums import ChatAction
+from pyrogram.errors import (
+    FloodWait,
+    MessageNotModified,
+    PeerIdInvalid,
+    UserIsBlocked,
+)
+from pyrogram.types import Message
 
 import config
 from bot.utils import db
-from bot.utils.ai import generate_reply
+from bot.utils.ai import call_openrouter
 from bot.utils.helpers import trim_history
 
 logger = logging.getLogger(__name__)
 
-# Per-account, per-peer locks:  session_id → { peer_id → Lock }
 _locks: dict[str, dict[str, asyncio.Lock]] = {}
 
 
-def _get_lock(session_id: str, peer_id: str) -> asyncio.Lock:
-    _locks.setdefault(session_id, {})
-    if peer_id not in _locks[session_id]:
-        _locks[session_id][peer_id] = asyncio.Lock()
-    return _locks[session_id][peer_id]
+def _get_lock(sid: str, peer: str) -> asyncio.Lock:
+    if sid not in _locks:
+        _locks[sid] = {}
+    if peer not in _locks[sid]:
+        _locks[sid][peer] = asyncio.Lock()
+    return _locks[sid][peer]
 
 
-async def _keep_typing(client: TelegramClient, peer, stop_event: asyncio.Event):
-    """Continuously sends typing action until stop_event is set."""
-    try:
-        while not stop_event.is_set():
-            await client.action(peer, "typing").__aenter__()
-            await asyncio.sleep(4)
-    except Exception:
-        pass
+async def _typing_loop(client: Client, chat_id: int, stop: asyncio.Event):
+    while not stop.is_set():
+        try:
+            await client.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=4)
+        except asyncio.TimeoutError:
+            pass
 
 
-def register(client: TelegramClient, session_id: str) -> None:
-    """Register DM event handler on the given Telethon client."""
+def register(app: Client, session_id: str) -> None:
 
-    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    async def on_private_message(event):
-        sender = await event.get_sender()
-        if sender is None or getattr(sender, "bot", False):
+    @app.on_message(
+        filters.private
+        & ~filters.me
+        & ~filters.bot
+        & ~filters.service
+    )
+    async def on_private_dm(client: Client, message: Message):
+        try:
+            await _handle_dm(client, message, session_id)
+        except Exception as e:
+            logger.error("[%s] Unhandled error in DM handler: %s", session_id, e, exc_info=True)
+
+    logger.info("[%s] aichat handlers registered.", session_id)
+
+
+async def _handle_dm(client: Client, message: Message, session_id: str):
+    msg_text = (message.text or message.caption or "").strip()
+    if not msg_text:
+        return
+
+    sender = message.from_user
+    if not sender:
+        return
+    peer_id = str(sender.id)
+
+    lock = _get_lock(session_id, peer_id)
+    if lock.locked():
+        return
+
+    async with lock:
+        acc = db.get_account(session_id, config.DEFAULT_PERSONA)
+        if acc is None:
+            logger.warning("[%s] Account not found in DB, skipping.", session_id)
             return
 
-        peer_id  = str(sender.id)
-        lock     = _get_lock(session_id, peer_id)
+        store = db.load()
 
-        async with lock:
-            acc = db.get_account(session_id, config.DEFAULT_PERSONA)
-            if acc is None:
-                return
+        global_on  = store.get("global_ai_on", False)
+        account_on = acc.get("ai_enabled", False)
+        if not global_on and not account_on:
+            return
 
-            # ── Global + per-account toggle ──────────────────────────────
-            store = db.load()
-            if not store.get("global_ai_on") and not acc.get("ai_enabled"):
-                return
+        now = time.time()
 
-            # ── Must have text ───────────────────────────────────────────
-            msg_text = event.message.text or ""
-            if not msg_text.strip():
-                return
+        # ── PAID PHOTO TRIGGER (multi-word) ───────────────────────────────────
+        trigger_words = list(getattr(config, "PAID_TRIGGER_WORDS", []))
+        # backwards compat with old single-word key
+        single = getattr(config, "PAID_TRIGGER_WORD", "")
+        if single and single not in trigger_words:
+            trigger_words.append(single)
 
-            # ── Paid-photo trigger ───────────────────────────────────────
-            if config.PAID_TRIGGER_WORD.lower() in msg_text.lower():
-                paid_id    = acc.get("paid_photo_id")
-                paid_stars = acc.get("paid_stars", 0)
-                if paid_id:
-                    try:
-                        await client.send_file(
-                            event.chat_id,
-                            paid_id,
-                        )
-                        logger.info("[%s] Paid photo sent to %s", session_id, peer_id)
-                    except Exception as exc:
-                        logger.error("[%s] Paid photo send failed: %s", session_id, exc)
-                    return  # don't also fire AI reply for trigger word
+        msg_lower = msg_text.lower()
+        triggered = any(
+            word.strip().lower() in msg_lower
+            for word in trigger_words
+            if word.strip()
+        )
+        if triggered:
+            await _send_paid_photo(client, message, acc, session_id, peer_id)
+            return
 
-            # ── Cooldown ─────────────────────────────────────────────────
-            now        = time.time()
-            last_times = acc.setdefault("last_msg_time", {})
-            if now - last_times.get(peer_id, 0) < config.COOLDOWN_SECONDS:
-                return
+        # ── rate-limit gate ───────────────────────────────────────────────────
+        rate_until = acc.get("rate_limited_until", 0)
+        if now < rate_until:
+            logger.info("[%s] Rate limited for %ds more, skipping.", session_id, int(rate_until - now))
+            return
 
-            # ── Rate-limit gate ──────────────────────────────────────────
-            if now < acc.get("rate_limited_until", 0):
-                return
+        # ── per-peer cooldown ─────────────────────────────────────────────────
+        last_times: dict = acc.get("last_msg_time", {})
+        if now - last_times.get(peer_id, 0.0) < config.COOLDOWN_SECONDS:
+            return
 
-            # ── Length guard ─────────────────────────────────────────────
-            if len(msg_text) > 1000:
-                msg_text = msg_text[:1000]
+        last_times[peer_id] = now
+        db.update_account(session_id, last_msg_time=last_times)
 
-            # Update cooldown timestamp immediately
-            acc["last_msg_time"][peer_id] = now
-            db.update_account(session_id, last_msg_time=acc["last_msg_time"])
+        if len(msg_text) > 1000:
+            msg_text = msg_text[:1000]
 
-            # ── Typing indicator ─────────────────────────────────────────
-            stop_typing = asyncio.Event()
-            typing_task = asyncio.create_task(
-                _keep_typing(client, event.chat_id, stop_typing)
+        # ── typing indicator ──────────────────────────────────────────────────
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _typing_loop(client, message.chat.id, stop_typing)
+        )
+
+        reply_text  = None
+        retry_after = None
+        try:
+            history = acc.get("history", {}).get(peer_id, [])
+            reply_text, retry_after = await asyncio.to_thread(
+                call_openrouter,
+                acc["persona"],
+                history,
+                msg_text,
             )
-
+        except Exception as e:
+            logger.error("[%s] AI call exception: %s", session_id, e, exc_info=True)
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
             try:
-                history = acc.get("history", {}).get(peer_id, [])
-                reply_text, retry_after = await generate_reply(
-                    acc["persona"], history, msg_text
-                )
-            finally:
-                stop_typing.set()
-                typing_task.cancel()
+                await typing_task
+            except asyncio.CancelledError:
+                pass
 
-            # ── Rate-limit handling ──────────────────────────────────────
-            if retry_after:
-                db.update_account(
-                    session_id,
-                    rate_limited_until=time.time() + retry_after,
-                )
-                # Don't reply to user on rate limit — silent fail
-                return
+        if retry_after:
+            db.update_account(session_id, rate_limited_until=time.time() + retry_after)
+            logger.warning("[%s] Rate limited, cooldown set for %ds.", session_id, retry_after)
+            return
 
-            # ── Send reply ───────────────────────────────────────────────
-            try:
-                await event.reply(reply_text)
-            except Exception as exc:
-                logger.error("[%s] Reply send error: %s", session_id, exc)
-                return
+        if not reply_text:
+            logger.warning("[%s] Empty reply from AI, skipping.", session_id)
+            return
 
-            db.increment_api_calls()
+        sent = await _safe_reply(client, message, reply_text, session_id)
+        if not sent:
+            return
 
-            # ── Update history ───────────────────────────────────────────
-            history.append({"role": "user",      "text": msg_text})
-            history.append({"role": "assistant", "text": reply_text})
-            history = trim_history(history, config.MAX_HISTORY_TURNS)
+        db.increment_api_calls()
 
-            acc_history = acc.get("history", {})
-            acc_history[peer_id] = history
-            db.update_account(session_id, history=acc_history)
+        history = acc.get("history", {}).get(peer_id, [])
+        history.append({"role": "user",      "text": msg_text})
+        history.append({"role": "assistant", "text": reply_text})
+        history = trim_history(history, config.MAX_HISTORY_TURNS)
 
-    logger.debug("[%s] AI chat handler registered.", session_id)
+        full_history = acc.get("history", {})
+        full_history[peer_id] = history
+        db.update_account(session_id, history=full_history)
+
+
+async def _send_paid_photo(
+    client: Client,
+    message: Message,
+    acc: dict,
+    session_id: str,
+    peer_id: str,
+):
+    """
+    Send paid photo from local file path (preferred) or file_id fallback.
+    Local path avoids cross-DC file_id issues between bot and userbot.
+    """
+    from pathlib import Path
+
+    photo_path = acc.get("paid_photo_path")
+    photo_id   = acc.get("paid_photo_file_id")
+
+    if not photo_path and not photo_id:
+        logger.info("[%s] Trigger word received but no paid photo set.", session_id)
+        return
+
+    stars   = acc.get("paid_stars", 0)
+    caption = f"⭐ {stars} Stars" if stars else "📸 Here you go!"
+
+    # prefer local file — always reliable
+    send_arg = photo_path if (photo_path and Path(photo_path).exists()) else photo_id
+
+    for attempt in range(3):
+        try:
+            await client.send_photo(
+                chat_id=message.chat.id,
+                photo=send_arg,
+                caption=caption,
+            )
+            logger.info("[%s] Paid photo sent to peer %s.", session_id, peer_id)
+            return
+        except FloodWait as e:
+            logger.warning("[%s] FloodWait %ds on paid photo.", session_id, e.value)
+            await asyncio.sleep(e.value + 1)
+        except (UserIsBlocked, PeerIdInvalid) as e:
+            logger.warning("[%s] Cannot send paid photo: %s", session_id, e)
+            return
+        except Exception as e:
+            logger.error("[%s] Paid photo error (attempt %d): %s", session_id, attempt + 1, e, exc_info=True)
+            await asyncio.sleep(2)
+
+    logger.error("[%s] Paid photo failed after 3 attempts.", session_id)
+
+
+async def _safe_reply(
+    client: Client,
+    message: Message,
+    text: str,
+    session_id: str,
+) -> bool:
+    for attempt in range(3):
+        try:
+            await message.reply_text(text)
+            return True
+        except FloodWait as e:
+            logger.warning("[%s] FloodWait %ds on reply.", session_id, e.value)
+            await asyncio.sleep(e.value + 1)
+        except (UserIsBlocked, PeerIdInvalid) as e:
+            logger.warning("[%s] Cannot reply: %s", session_id, e)
+            return False
+        except MessageNotModified:
+            return True
+        except Exception as e:
+            logger.error("[%s] Reply error (attempt %d): %s", session_id, attempt + 1, e, exc_info=True)
+            await asyncio.sleep(2)
+    return False
