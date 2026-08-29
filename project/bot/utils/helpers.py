@@ -1,43 +1,36 @@
-"""
-bot/utils/helpers.py
-────────────────────
-Shared formatting / utility functions.
-"""
-
-import time
-
-
-def fmt_uptime(seconds: int) -> str:
-    days,    rem  = divmod(seconds, 86400)
-    hours,   rem  = divmod(rem, 3600)
-    minutes, secs = divmod(rem, 60)
-    parts = []
-    if days:    parts.append(f"{days}d")
-    if hours:   parts.append(f"{hours}h")
-    if minutes: parts.append(f"{minutes}m")
-    parts.append(f"{secs}s")
+def fmt_uptime(secs: int) -> str:
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s   = divmod(rem, 60)
+    parts  = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    parts.append(f"{s}s")
     return " ".join(parts)
 
 
 def trim_history(history: list, max_turns: int) -> list:
-    """Keep last max_turns complete exchanges (each = 2 items)."""
     cap = max_turns * 2
-    if len(history) > cap:
-        history = history[-cap:]
-    # ensure history starts with a user turn
-    while history and history[0].get("role") != "user":
-        history = history[1:]
-    return history
+    h   = list(history[-cap:]) if len(history) > cap else list(history)
+    while h and h[0].get("role") != "user":
+        h = h[1:]
+    return h
 
 
-def is_admin(user_id: int, admin_ids: list[int]) -> bool:
+def is_admin(user_id: int, admin_ids: list) -> bool:
     return user_id in admin_ids
 
 
-def credits_text(cred: dict) -> str:
-    if cred.get("used") is None:
-        return "Credit info unavailable"
-    used  = f"${cred['used']:.4f}"
-    limit = f"${cred['limit']:.4f}"  if cred["limit"]     else "Unlimited"
-    left  = f"${cred['remaining']:.4f}" if cred["remaining"] else "∞"
-    return f"Used: {used}  |  Limit: {limit}  |  Left: {left}"
+def credits_text(c: dict) -> str:
+    if "error" in c:
+        return f"Unavailable ({c['error'][:50]})"
+    used  = f"${c['used']:.4f}"
+    limit = f"${c['limit']:.4f}" if c.get("limit") is not None else "Unlimited"
+    left  = f"${c['remaining']:.4f}" if c.get("remaining") is not None else "∞"
+    return f"Used {used} / {limit}  —  Left: {left}"
+
+
+# alias used by new code
+def credits_line(c: dict) -> str:
+    return credits_text(c)
